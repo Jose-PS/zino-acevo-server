@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import live
+from . import event_store, live
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_SERVER_SCRIPT = Path(os.environ.get("ACEVO_RUN_SERVER", str(REPO_ROOT / "scripts" / "run_server.sh")))
@@ -44,6 +44,14 @@ def _write_stdout(data: bytes) -> None:
     sys.stdout.flush()
 
 
+def _report_store_error(action: str, exc: Exception) -> None:
+    try:
+        sys.stderr.write(f"[dashboard] event store {action} failed: {exc}\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _tee_output(proc: subprocess.Popen, log_file: Path, generation: int | None = None) -> None:
     if proc.stdout is None:
         return
@@ -60,6 +68,10 @@ def _tee_output(proc: subprocess.Popen, log_file: Path, generation: int | None =
                     live.consume_line(chunk, generation)
                 except Exception:  # noqa: BLE001 - live data must never affect the server process
                     pass
+                try:
+                    event_store.record(chunk)
+                except Exception as exc:  # noqa: BLE001 - the event store must never affect the server process
+                    _report_store_error("record", exc)
                 _write_stdout(chunk)
     finally:
         try:
@@ -126,6 +138,10 @@ def start() -> dict:
             return {"ok": False, "error": f"run script not found: {RUN_SERVER_SCRIPT}"}
         try:
             LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                event_store.import_file(LOG_FILE)
+            except Exception as exc:  # noqa: BLE001 - a failed import must not block the server start
+                _report_store_error("import", exc)
             with open(LOG_FILE, "wb", buffering=0):
                 pass  # fresh log per server run
             generation = live.reset()

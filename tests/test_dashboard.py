@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from dashboard import app, config_io, live, metadata, mods, server_control
+from dashboard import app, config_io, event_store, live, metadata, mods, server_control
 from scripts import launch_payloads
 
 FIXTURE = Path(__file__).parent / "fixtures" / "server_launcher_windows_sample.json"
@@ -562,6 +562,10 @@ class ServerControlTests(unittest.TestCase):
         patcher = patch.object(server_control, "LOG_FILE", self.tmp / "logs" / "server.log")
         patcher.start()
         self.addCleanup(patcher.stop)
+        db_patcher = patch.object(event_store, "DB_PATH", self.tmp / "events.sqlite")
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+        self.addCleanup(event_store.flush)
         server_control._proc = None
         server_control._last_exit = None
         server_control._log_thread = None
@@ -681,6 +685,64 @@ class ServerControlTests(unittest.TestCase):
         self.assertEqual(server_control.LOG_FILE.read_bytes(), output)
         self.assertEqual(captured.getvalue(), output)
         self.assertEqual(live.snapshot()["drivers"][0]["name"], "Max Bearman")
+
+    def test_tee_output_records_events_without_ping_lines(self):
+        output = b"[a] first\n[b] Received Ping\n[c] third\n"
+        proc = FakeProc(stdout=io.BytesIO(output))
+        server_control.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with patch.object(server_control.sys, "stdout", io.StringIO()):
+            server_control._tee_output(proc, server_control.LOG_FILE)
+        event_store.flush()
+        lines = [event["line"] for event in event_store.fetch()["events"]]
+        self.assertEqual(lines, ["[a] first", "[c] third"])
+
+    def test_tee_output_survives_event_store_failure(self):
+        output = b"line1\nline2\n"
+        proc = FakeProc(stdout=io.BytesIO(output))
+        captured = io.BytesIO()
+
+        class Stdout:
+            buffer = captured
+
+        server_control.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            patch.object(server_control.sys, "stdout", Stdout()),
+            patch.object(event_store, "record", side_effect=RuntimeError("db down")),
+            patch.object(server_control.sys, "stderr", io.StringIO()),
+        ):
+            server_control._tee_output(proc, server_control.LOG_FILE)
+        self.assertEqual(server_control.LOG_FILE.read_bytes(), output)
+        self.assertEqual(captured.getvalue(), output)
+
+    def _start_with_fake_script(self):
+        script = self.tmp / "run_server.sh"
+        script.write_text("#!/usr/bin/env bash\n")
+        with (
+            patch.object(server_control, "RUN_SERVER_SCRIPT", script),
+            patch.object(server_control.subprocess, "Popen", return_value=FakeProc(pid=4242)),
+        ):
+            return server_control.start()
+
+    def test_start_imports_existing_log_before_truncating(self):
+        server_control.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        server_control.LOG_FILE.write_bytes(b"[a] old one\n[b] Received Ping\n[c] old two\n")
+        result = self._start_with_fake_script()
+        self.assertTrue(result["ok"])
+        event_store.flush()
+        lines = [event["line"] for event in event_store.fetch()["events"]]
+        self.assertEqual(lines, ["[a] old one", "[c] old two"])
+        self.assertEqual(server_control.LOG_FILE.read_bytes(), b"")
+
+    def test_start_continues_when_import_fails(self):
+        server_control.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        server_control.LOG_FILE.write_bytes(b"[a] old\n")
+        with (
+            patch.object(event_store, "import_file", side_effect=RuntimeError("db down")),
+            patch.object(server_control.sys, "stderr", io.StringIO()),
+        ):
+            result = self._start_with_fake_script()
+        self.assertTrue(result["ok"])
+        self.assertEqual(server_control.LOG_FILE.read_bytes(), b"")
 
 
 class BasicAuthTests(unittest.TestCase):

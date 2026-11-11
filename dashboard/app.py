@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import config_io, live, metadata, mods, server_control
+from . import config_io, event_store, live, metadata, mods, server_control
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -166,6 +166,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if route == "/api/server/logs":
                 tail = int((parse_qs(parts.query).get("tail") or ["200"])[0] or 200)
                 return self._send_json(server_control.logs(tail=tail))
+            if route == "/api/server/events":
+                query = parse_qs(parts.query)
+                try:
+                    after = int((query.get("after") or ["0"])[0] or 0)
+                    limit = int(
+                        (query.get("limit") or [str(event_store.DEFAULT_LIMIT)])[0] or event_store.DEFAULT_LIMIT
+                    )
+                except ValueError:
+                    return self._send_json({"error": "after and limit must be integers"}, 400)
+                if after < 0 or not 1 <= limit <= event_store.MAX_LIMIT:
+                    return self._send_json({"error": "after or limit out of range"}, 400)
+                return self._send_json(event_store.fetch(after=after, limit=limit))
             if route == "/api/mods/upload/status":
                 upload_id = (parse_qs(parts.query).get("upload_id") or [""])[0]
                 return self._send_json(mods.upload_status(upload_id))
