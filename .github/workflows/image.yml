@@ -50,3 +50,107 @@ jobs:
           tags: |
             ${{ env.GHCR_IMAGE }}:latest
             ${{ env.GHCR_IMAGE }}:${{ github.event.workflow_run.head_sha }}
+
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      packages: read
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: GHCR_USER,GHCR_TOKEN,IMAGE_TAG
+          script: |
+            set -euo pipefail
+            cd "$HOME/acevo-server"
+            test -f docker-compose.override.yml
+            touch .env
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+
+            panel_py=$(cat <<'PYEOF'
+            import base64, json, os, sys, urllib.request
+            port = os.environ.get("DASHBOARD_PORT", "8090")
+            request = urllib.request.Request("http://127.0.0.1:%s%s" % (port, sys.argv[1]))
+            password = os.environ.get("DASHBOARD_PASSWORD", "")
+            if password:
+                credentials = "%s:%s" % (os.environ.get("DASHBOARD_USER", "admin"), password)
+                request.add_header("Authorization", "Basic " + base64.b64encode(credentials.encode()).decode())
+            body = urllib.request.urlopen(request, timeout=10).read().decode()
+            if len(sys.argv) > 2 and sys.argv[2] == "count":
+                data = json.loads(body)
+                print(max(int(data.get("players") or 0), len(data.get("drivers") or [])))
+            else:
+                print(body)
+            PYEOF
+            )
+
+            panel() {
+              docker exec -i acevo-server python3 -c "$panel_py" "$@"
+            }
+
+            previous_tag=$(grep '^ZINO_IMAGE_TAG=' .env | tail -n 1 | cut -d= -f2- || true)
+
+            if grep -q '^ZINO_IMAGE_TAG=' .env; then
+              sed -i "s|^ZINO_IMAGE_TAG=.*|ZINO_IMAGE_TAG=${IMAGE_TAG}|" .env
+            else
+              echo "ZINO_IMAGE_TAG=${IMAGE_TAG}" >> .env
+            fi
+
+            docker compose pull acevo-server
+
+            pilots=unknown
+            for i in $(seq 1 30); do
+              running=$(docker inspect -f '{{.State.Running}}' acevo-server 2>/dev/null || echo false)
+              if [ "$running" != "true" ]; then
+                pilots=0
+                break
+              fi
+              if out=$(panel /api/server/live count 2>/dev/null); then
+                pilots="$out"
+              else
+                pilots=unknown
+              fi
+              if [ "$pilots" = "0" ]; then
+                break
+              fi
+              echo "Intento $i/30: pilotos conectados o panel sin respuesta ($pilots), espero 60 s"
+              if [ "$i" -lt 30 ]; then
+                sleep 60
+              fi
+            done
+            if [ "$pilots" != "0" ]; then
+              echo "Despliegue cancelado: tras 30 minutos sigue habiendo pilotos conectados o el panel no responde ($pilots). No se reinicia el servidor." >&2
+              exit 1
+            fi
+
+            docker compose up -d acevo-server
+
+            ok=0
+            for i in $(seq 1 36); do
+              if panel /api/server/status >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$ok" != "1" ]; then
+              docker compose logs --tail=80 acevo-server
+              exit 1
+            fi
+
+            image_repo=ghcr.io/jose-ps/zino-acevo-server
+            docker images "$image_repo" --format '{{.Repository}}:{{.Tag}}' \
+              | { grep -v -x -F -e "$image_repo:$IMAGE_TAG" -e "$image_repo:${previous_tag:-__sin_tag_anterior__}" || true; } \
+              | { grep -v -F ':<none>' || true; } \
+              | { xargs -r docker rmi || true; }
